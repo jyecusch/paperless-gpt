@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -237,146 +239,166 @@ func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int
 
 	log.Debugf("Found at least %d remaining documents with tag %s", len(documents), triggerTag)
 
-	var errs []error
-	processedCount := 0
-
+	var (
+		mu             sync.Mutex
+		wg             sync.WaitGroup
+		errs           []error
+		processedCount int
+	)
+	// Documents are independent, so up to AUTO_TAG_WORKERS run at once. With
+	// the default of 1 they run one after another, as before.
+	slots := make(chan struct{}, autoTagWorkerCount())
 	for _, docSummary := range documents {
-		// Get the full document details, including custom fields
-		document, err := app.Client.GetDocument(ctx, docSummary.ID)
-		if err != nil {
-			err = fmt.Errorf("error fetching full details for document %d: %w", docSummary.ID, err)
-			documentLogger(docSummary.ID).Error(err.Error())
-			errs = append(errs, err)
-			continue
-		}
-
-		// Skip documents that have the autoOcrTag
-		if slices.Contains(document.Tags, autoOcrTag) {
-			log.Debugf("Skipping document %d as it has the OCR tag %s", document.ID, autoOcrTag)
-			continue
-		}
-
-		docLogger := documentLogger(document.ID)
-		workflow := app.workflowRouter().WorkflowFor(document, triggerTag)
-		if workflow != nil {
-			docLogger.Infof("Processing document for workflow %q (trigger tag: %s)", workflow.ID, triggerTag)
-		} else {
-			docLogger.Info("Processing document for auto-tagging")
-		}
-
-		// Optional per-workflow OCR before metadata generation.
-		if workflow != nil {
-			if wf := *workflow; workflowWantsOCR(wf) {
-				if !app.isOcrEnabled() {
-					// Retrying cannot help until the configuration changes, so
-					// take the document out of the loop right away instead of
-					// fetching it again on every poll.
-					err = fmt.Errorf("workflow %q has enable_ocr but no OCR provider is configured", wf.ID)
-					docLogger.Error(err.Error())
-					if recErr := markProcessingFailed(ctx, app.Client, app.Database, document, triggerTag, "workflow OCR is enabled but no OCR provider is configured"); recErr != nil {
-						errs = append(errs, fmt.Errorf("%w (removing the %q tag failed: %v)", err, triggerTag, recErr))
-					}
-					continue
-				}
-				updatedDoc, ocrErr := app.runWorkflowDocumentOCR(ctx, document, wf, triggerTag, docLogger)
-				if ocrErr != nil {
-					errs = append(errs, ocrErr)
-					continue
-				}
-				if updatedDoc == nil {
-					// OCR skipped or document left the queue (e.g. max retries).
-					continue
-				}
-				document = *updatedDoc
-			}
-		}
-
-		suggestionRequest := globalAutoProcessingRequest(document)
-		suggestionRequest.IsAutoProcessing = true
-		suggestionRequest.Workflow = workflow
-		suggestionRequest.TriggerTag = triggerTag
-
-		suggestions, err := app.generateDocumentSuggestions(ctx, suggestionRequest, docLogger)
-		if err != nil {
-			err = fmt.Errorf("error generating suggestions for document %d: %w", document.ID, err)
-			docLogger.Error(err.Error())
-
-			// Without a loop-break here the auto tag stays on the document and
-			// it is picked up again every poll cycle, forever. A permanent LLM
-			// error (a prompt that cannot fit the context, a model that no
-			// longer exists) therefore re-bills the same request indefinitely,
-			// and because GetDocumentsByTag fetches one unordered page, enough
-			// such documents fill that page and starve every document behind
-			// them — silently, since the container stays healthy. See #1071.
-			//
-			// A canceled poll-loop context is a shutdown, not a document
-			// problem, so it must never count against the document. Same
-			// reasoning as the auto-OCR poll below.
-			if autoTagMaxRetries > 0 && ctx.Err() == nil {
-				attempts := app.suggestionFailures.recordFailure(document.ID)
-				if attempts >= autoTagMaxRetries {
-					reason := fmt.Sprintf("suggestion generation failed %d times", attempts)
-					if recErr := markProcessingFailed(ctx, app.Client, app.Database, document, triggerTag, reason); recErr != nil {
-						// Keep the failure count so the tag removal is retried
-						// on the next poll cycle.
-						docLogger.Errorf("Removing %q tag after repeated suggestion failures also failed: %v. The document will be retried on the next poll cycle.", triggerTag, recErr)
-						errs = append(errs, err)
-						continue
-					}
-					app.suggestionFailures.reset(document.ID)
-					// The document is out of the queue now; don't let its
-					// handled error keep the whole loop in backoff.
-					continue
-				}
-			}
-			errs = append(errs, err)
-			continue
-		}
-		// Suggestions came back — a previous failure streak is over, whatever
-		// the update below does.
-		app.suggestionFailures.reset(document.ID)
-
-		if workflow != nil && workflow.RequireApproval && len(suggestions) == 1 {
-			if err := app.holdForApproval(ctx, document, suggestions[0], *workflow, triggerTag, docLogger); err != nil {
-				docLogger.Error(err.Error())
-				errs = append(errs, err)
-				app.Database.Delete(&PendingReview{}, document.ID)
-				recoverFromFailedUpdate(ctx, app.Client, app.Database, document, triggerTag)
-				continue
-			}
-			processedCount++
-			continue
-		}
-
-		err = app.Client.UpdateDocuments(ctx, suggestions, app.Database, false)
-		if err != nil {
-			var partial *PartialUpdateError
-			if errors.As(err, &partial) {
-				// Update went through but paperless-ngx rejected some fields,
-				// which UpdateDocuments dropped in order to land the rest.
-				// The auto tag is already gone (it was part of the successful
-				// retry's tag update). Apply the fail tag so the user sees
-				// that this document needs review.
-				applyFailTagAfterPartialSuccess(ctx, app.Client, app.Database, partial.DocumentID, partial.DroppedFields)
+		slots <- struct{}{}
+		wg.Add(1)
+		go func(documentID int) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			processed, err := app.processTagDocument(ctx, documentID, triggerTag)
+			mu.Lock()
+			defer mu.Unlock()
+			if processed {
 				processedCount++
-				continue
 			}
-			err = fmt.Errorf("error updating document %d: %w", document.ID, err)
-			docLogger.Error(err.Error())
-			errs = append(errs, err)
-			recoverFromFailedUpdate(ctx, app.Client, app.Database, document, triggerTag)
-			continue
-		}
-
-		docLogger.Info("Successfully processed document")
-		processedCount++
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}(docSummary.ID)
 	}
+	wg.Wait()
 
 	if len(errs) > 0 {
 		return processedCount, errors.Join(errs...)
 	}
 
 	return processedCount, nil
+}
+
+// processTagDocument runs the suggestion pipeline for one document with the
+// given trigger tag. It reports whether the document was processed, and any
+// error worth surfacing to the poll loop.
+func (app *App) processTagDocument(ctx context.Context, documentID int, triggerTag string) (bool, error) {
+	// Get the full document details, including custom fields
+	document, err := app.Client.GetDocument(ctx, documentID)
+	if err != nil {
+		err = fmt.Errorf("error fetching full details for document %d: %w", documentID, err)
+		documentLogger(documentID).Error(err.Error())
+		return false, err
+	}
+
+	// Skip documents that have the autoOcrTag
+	if slices.Contains(document.Tags, autoOcrTag) {
+		log.Debugf("Skipping document %d as it has the OCR tag %s", document.ID, autoOcrTag)
+		return false, nil
+	}
+
+	docLogger := documentLogger(document.ID)
+	workflow := app.workflowRouter().WorkflowFor(document, triggerTag)
+	if workflow != nil {
+		docLogger.Infof("Processing document for workflow %q (trigger tag: %s)", workflow.ID, triggerTag)
+	} else {
+		docLogger.Info("Processing document for auto-tagging")
+	}
+
+	// Optional per-workflow OCR before metadata generation.
+	if workflow != nil {
+		if wf := *workflow; workflowWantsOCR(wf) {
+			if !app.isOcrEnabled() {
+				// Retrying cannot help until the configuration changes, so
+				// take the document out of the loop right away instead of
+				// fetching it again on every poll.
+				err = fmt.Errorf("workflow %q has enable_ocr but no OCR provider is configured", wf.ID)
+				docLogger.Error(err.Error())
+				if recErr := markProcessingFailed(ctx, app.Client, app.Database, document, triggerTag, "workflow OCR is enabled but no OCR provider is configured"); recErr != nil {
+					return false, fmt.Errorf("%w (removing the %q tag failed: %v)", err, triggerTag, recErr)
+				}
+				return false, nil
+			}
+			updatedDoc, ocrErr := app.runWorkflowDocumentOCR(ctx, document, wf, triggerTag, docLogger)
+			if ocrErr != nil {
+				return false, ocrErr
+			}
+			if updatedDoc == nil {
+				// OCR skipped or document left the queue (e.g. max retries).
+				return false, nil
+			}
+			document = *updatedDoc
+		}
+	}
+
+	suggestionRequest := globalAutoProcessingRequest(document)
+	suggestionRequest.IsAutoProcessing = true
+	suggestionRequest.Workflow = workflow
+	suggestionRequest.TriggerTag = triggerTag
+
+	suggestions, err := app.generateDocumentSuggestions(ctx, suggestionRequest, docLogger)
+	if err != nil {
+		err = fmt.Errorf("error generating suggestions for document %d: %w", document.ID, err)
+		docLogger.Error(err.Error())
+
+		// Without a loop-break here the auto tag stays on the document and
+		// it is picked up again every poll cycle, forever. A permanent LLM
+		// error (a prompt that cannot fit the context, a model that no
+		// longer exists) therefore re-bills the same request indefinitely,
+		// and because GetDocumentsByTag fetches one unordered page, enough
+		// such documents fill that page and starve every document behind
+		// them — silently, since the container stays healthy. See #1071.
+		//
+		// A canceled poll-loop context is a shutdown, not a document
+		// problem, so it must never count against the document. Same
+		// reasoning as the auto-OCR poll below.
+		if autoTagMaxRetries > 0 && ctx.Err() == nil {
+			attempts := app.suggestionFailures.recordFailure(document.ID)
+			if attempts >= autoTagMaxRetries {
+				reason := fmt.Sprintf("suggestion generation failed %d times", attempts)
+				if recErr := markProcessingFailed(ctx, app.Client, app.Database, document, triggerTag, reason); recErr != nil {
+					// Keep the failure count so the tag removal is retried
+					// on the next poll cycle.
+					docLogger.Errorf("Removing %q tag after repeated suggestion failures also failed: %v. The document will be retried on the next poll cycle.", triggerTag, recErr)
+					return false, err
+				}
+				app.suggestionFailures.reset(document.ID)
+				// The document is out of the queue now; don't let its
+				// handled error keep the whole loop in backoff.
+				return false, nil
+			}
+		}
+		return false, err
+	}
+	// Suggestions came back — a previous failure streak is over, whatever
+	// the update below does.
+	app.suggestionFailures.reset(document.ID)
+
+	if workflow != nil && workflow.RequireApproval && len(suggestions) == 1 {
+		if err := app.holdForApproval(ctx, document, suggestions[0], *workflow, triggerTag, docLogger); err != nil {
+			docLogger.Error(err.Error())
+			app.Database.Delete(&PendingReview{}, document.ID)
+			recoverFromFailedUpdate(ctx, app.Client, app.Database, document, triggerTag)
+			return false, err
+		}
+		return true, nil
+	}
+
+	err = app.Client.UpdateDocuments(ctx, suggestions, app.Database, false)
+	if err != nil {
+		var partial *PartialUpdateError
+		if errors.As(err, &partial) {
+			// Update went through but paperless-ngx rejected some fields,
+			// which UpdateDocuments dropped in order to land the rest.
+			// The auto tag is already gone (it was part of the successful
+			// retry's tag update). Apply the fail tag so the user sees
+			// that this document needs review.
+			applyFailTagAfterPartialSuccess(ctx, app.Client, app.Database, partial.DocumentID, partial.DroppedFields)
+			return true, nil
+		}
+		err = fmt.Errorf("error updating document %d: %w", document.ID, err)
+		docLogger.Error(err.Error())
+		recoverFromFailedUpdate(ctx, app.Client, app.Database, document, triggerTag)
+		return false, err
+	}
+
+	docLogger.Info("Successfully processed document")
+	return true, nil
 }
 
 // runWorkflowDocumentOCR runs OCR for a workflow-tagged document, writes the
@@ -702,4 +724,20 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 	}
 
 	return successCount, nil
+}
+
+// autoTagWorkerCount reads AUTO_TAG_WORKERS: how many documents the auto-tag
+// poll processes at once. Defaults to 1.
+func autoTagWorkerCount() int {
+	value := os.Getenv("AUTO_TAG_WORKERS")
+	if value == "" {
+		return 1
+	}
+
+	workers, err := strconv.Atoi(value)
+	if err != nil || workers < 1 {
+		return 1
+	}
+
+	return workers
 }

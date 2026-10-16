@@ -44,8 +44,10 @@ func InitializeDB() *gorm.DB {
 
 	dbPath := filepath.Join(dbDir, "modification_history.db")
 
-	// Connect to SQLite database
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	// Connect to SQLite database. The busy timeout makes concurrent writers,
+	// such as parallel auto-tag workers, wait for the lock instead of failing
+	// with "database is locked".
+	db, err := gorm.Open(sqlite.Open(dbPath+"?_busy_timeout=5000"), &gorm.Config{})
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
